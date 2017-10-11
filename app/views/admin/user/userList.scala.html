@@ -1,37 +1,46 @@
-@(
-  q: String, sortBy: String, count: Int, page: Int, users: Seq[models.user.User], requestCounts: Map[java.util.UUID, Int]
-)(implicit session: Session, flash: Flash)@views.html.admin.list(
-  "user", "Users", "explore", count, page, users.size, q,
-  searchAction = controllers.admin.routes.UserController.userList(),
-  prevLink = controllers.admin.routes.UserController.userList(q, sortBy, page - 1),
-  nextLink = controllers.admin.routes.UserController.userList(q, sortBy, page + 1)
-) {
-  <table class="table table-bordered">
-    <thead>
-      <tr>
-        @utils.play.ViewUtils.th("id", "User ID", sortBy)
-        @utils.play.ViewUtils.th("username", "Username", sortBy)
-        @utils.play.ViewUtils.th("requests", "Requests", sortBy)
-        @utils.play.ViewUtils.th("roles", "Roles", sortBy)
-        @utils.play.ViewUtils.th("profiles", "Profiles", sortBy, link = false)
-        @utils.play.ViewUtils.th("created", "Created", sortBy)
-        @utils.play.ViewUtils.th("actions", "", sortBy)
-      </tr>
-    </thead>
-    <tbody>
-      @for(u <- users) {
-        <tr>
-          <td><a href="@controllers.admin.routes.UserController.userDetail(u.id)">@u.id</a></td>
-          <td>@u.username</td>
-          <td>@utils.Formatter.withCommas(requestCounts.getOrElse(u.id, 0))</td>
-          <td>@Html(u.roles.map(_.name).mkString(",<br/>"))</td>
-          <td>@Html(u.profiles.map(x => s"${x.providerID}:${x.providerKey}").mkString(",<br/>"))</td>
-          <td>@u.created.toString("yyyy-MM-dd HH:mm:ss")</td>
-          <td>
-            <a href="@controllers.admin.routes.UserController.removeUser(u.id)" class="btn btn-default btn-xs"><span class="glyphicon glyphicon-remove"></span></a>
-          </td>
-        </tr>
-      }
-    </tbody>
-  </table>
+@(user: models.user.User, q: Option[String], orderBy: Option[String], orderAsc: Boolean, totalCount: Option[Int], users: Seq[models.user.User], limit: Int, offset: Int)(
+    implicit request: Request[AnyContent], session: Session, flash: Flash, traceData: util.tracing.TraceData
+)
+
+@resultFor(user: models.user.User) = {
+  <tr>
+    <td><a class="theme-text" href="@controllers.admin.user.routes.UserController.view(user.id)">@user.id</a></td>
+    <td>@user.username</td>
+    <td>@user.profile.providerKey</td>
+    <td><div class="theme-swatch" style="background-color: @user.preferences.theme.color"></div></td>
+    <td>@user.role</td>
+    <td>@util.DateUtils.niceDate(user.created.toLocalDate)</td>
+    <td>@defining(s"return confirm('Are you certain you want to delete this user (${user.username})?');") { onClick =>
+      <a class="theme-text" onclick="@onClick" href="@controllers.admin.user.routes.UserController.remove(user.id)"><i class="fa fa-close"></i></a>
+    }</td>
+  </tr>
 }
+
+@traceData.logViewClass(getClass)
+
+@views.html.admin.explore.list(
+  user = user,
+  model = "User",
+  modelPlural = "Users",
+  icon = models.template.Icons.user,
+  cols = Seq(
+    "id" -> "ID",
+    "username" -> "Username",
+    "provider" -> "Email",
+    "theme" -> "Theme",
+    "role" -> "Role",
+    "created" -> "Created",
+    "actions" -> ""
+  ),
+  orderBy = orderBy,
+  orderAsc = orderAsc,
+  rows = users.map(resultFor),
+  totalCount = totalCount,
+  newUrl = Some(controllers.admin.user.routes.UserController.createForm()),
+  orderByUrl = Some(controllers.admin.user.routes.UserController.list(q, _, _, Some(limit), Some(0))),
+  searchUrl = Some(controllers.admin.user.routes.UserController.list(None, orderBy, orderAsc, Some(limit), None)),
+  nextUrl = controllers.admin.user.routes.UserController.list(q, orderBy, orderAsc, Some(limit), Some(offset + limit)),
+  limit = limit,
+  offset = offset,
+  q = q
+)

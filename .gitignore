@@ -1,5 +1,6 @@
 logs
-project/project
+conf/generated.keystore
+project/project/target
 project/target
 target
 tmp
@@ -8,6 +9,7 @@ dist
 /.idea
 /*.iml
 /out
+/data/backup
 /.idea_modules
 /.classpath
 /.project

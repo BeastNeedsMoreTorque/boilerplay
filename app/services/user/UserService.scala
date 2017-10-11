@@ -2,101 +2,113 @@ package services.user
 
 import java.util.UUID
 
-import com.github.mauricio.async.db.Connection
-import com.mohiva.play.silhouette.api.AuthInfo
-import com.mohiva.play.silhouette.impl.providers.CommonSocialProfile
-import models.database.queries.auth._
-import models.user.{ Role, User }
-import play.api.libs.concurrent.Execution.Implicits.defaultContext
-import services.database.Database
-import services.history.RequestHistoryService
-import utils.Logging
-import utils.cache.UserCache
+import com.mohiva.play.silhouette.api.LoginInfo
+import com.mohiva.play.silhouette.api.util.PasswordHasher
+import com.mohiva.play.silhouette.impl.providers.CredentialsProvider
+import models.queries.auth._
+import models.result.data.DataField
+import models.result.filter.Filter
+import models.result.orderBy.OrderBy
+import models.user.{Role, User}
+import services.ModelServiceHelper
+import util.FutureUtils.databaseContext
+import services.database.SystemDatabase
+import services.cache.UserCache
+import util.tracing.{TraceData, TracingService}
 
 import scala.concurrent.Future
 
-object UserService extends Logging {
-  def create[A <: AuthInfo](currentUser: User, profile: CommonSocialProfile): Future[User] = {
-    log.info(s"Saving profile [$profile].")
-    UserSearchService.retrieve(profile.loginInfo).flatMap {
-      case Some(existingUser) =>
-        if (existingUser.id == currentUser.id) {
-          val u = existingUser.copy(
-            profiles = existingUser.profiles.filterNot(_.providerID == profile.loginInfo.providerID) :+ profile.loginInfo
-          )
-          save(u, update = true)
-        } else {
-          Future.successful(existingUser)
-        }
-      case None => // Link to currentUser
-        Database.execute(ProfileQueries.insert(profile)).flatMap { x =>
-          val u = currentUser.copy(
-            profiles = currentUser.profiles.filterNot(_.providerID == profile.loginInfo.providerID) :+ profile.loginInfo
-          )
-          save(u, update = true)
-        }
-    }
+@javax.inject.Singleton
+class UserService @javax.inject.Inject() (override val tracing: TracingService, hasher: PasswordHasher) extends ModelServiceHelper[User]("user") {
+  def getByPrimaryKey(id: UUID)(implicit trace: TraceData) = traceF("get.by.primary.key") { td =>
+    SystemDatabase.query(UserQueries.getByPrimaryKey(Seq(id)))(td)
+  }
+  def getByPrimaryKeySeq(idSeq: Seq[UUID])(implicit trace: TraceData) = traceF("get.by.primary.key.sequence") { td =>
+    SystemDatabase.query(UserQueries.getByPrimaryKeySeq(idSeq))(td)
   }
 
-  def save(user: User, update: Boolean = false): Future[User] = {
-    val statement = if (update) {
-      log.info(s"Updating user [$user].")
-      UserQueries.UpdateUser(user)
-    } else {
-      log.info(s"Creating new user [$user].")
-      UserQueries.insert(user)
-    }
-    Database.execute(statement).map { i =>
-      UserCache.cacheUser(user)
-      user
-    }
+  def getByRoleSeq(roleSeq: Seq[Role])(implicit trace: TraceData) = traceF("get.by.role.sequence") { td =>
+    SystemDatabase.query(UserQueries.getByRoleSeq(roleSeq))(td)
   }
 
-  def remove(userId: UUID) = {
-    val start = System.currentTimeMillis
-    Database.transaction { conn =>
-      for {
-        requests <- RequestHistoryService.removeRequestsByUser(userId, Some(conn))
-        profiles <- removeProfiles(userId, Some(conn)).map(_.length)
-        users <- Database.execute(UserQueries.removeById(Seq(userId)), Some(conn))
-      } yield {
+  override def countAll(filters: Seq[Filter] = Nil)(implicit trace: TraceData) = traceF("count.all") { td =>
+    SystemDatabase.query(UserQueries.countAll(filters))(td)
+  }
+  override def getAll(filters: Seq[Filter], orderBys: Seq[OrderBy], limit: Option[Int] = None, offset: Option[Int] = None)(implicit trace: TraceData) = {
+    traceF("get.all")(td => SystemDatabase.query(UserQueries.getAll(filters, orderBys, limit, offset))(td))
+  }
+
+  override def searchCount(q: String, filters: Seq[Filter])(implicit trace: TraceData) = {
+    traceF("search.count")(td => SystemDatabase.query(UserQueries.searchCount(q, filters))(td))
+  }
+  override def search(q: String, filters: Seq[Filter], orderBys: Seq[OrderBy], limit: Option[Int], offset: Option[Int])(implicit trace: TraceData) = {
+    traceF("search")(td => SystemDatabase.query(UserQueries.search(q, filters, orderBys, limit, offset))(td))
+  }
+  def searchExact(q: String, orderBys: Seq[OrderBy], limit: Option[Int], offset: Option[Int])(implicit trace: TraceData) = {
+    traceF("search.exact")(td => SystemDatabase.query(UserQueries.searchExact(q, orderBys, limit, offset))(td))
+  }
+
+  def isUsernameInUse(name: String)(implicit trace: TraceData) = traceF("username.in.use") { td =>
+    SystemDatabase.query(UserSearchQueries.IsUsernameInUse(name))(td)
+  }
+
+  def insert(user: User)(implicit trace: TraceData) = traceF("insert")(td => SystemDatabase.execute(UserQueries.insert(user))(td).map { _ =>
+    log.info(s"Inserted user [$user].")
+    UserCache.cacheUser(user)
+    user
+  })
+
+  def update(user: User)(implicit trace: TraceData) = traceF("update")(td => SystemDatabase.execute(UserQueries.UpdateUser(user))(td).map { _ =>
+    log.info(s"Updated user [$user].")
+    UserCache.cacheUser(user)
+    user
+  })
+
+  def remove(userId: UUID)(implicit trace: TraceData) = traceF("remove")(td => SystemDatabase.transaction { (txTd, conn) =>
+    val startTime = System.nanoTime
+    val f = getByPrimaryKey(userId)(txTd).flatMap {
+      case Some(user) => SystemDatabase.execute(PasswordInfoQueries.removeByPrimaryKey(Seq(user.profile.providerID, user.profile.providerKey)), Some(conn))
+      case None => throw new IllegalStateException("Invalid User")
+    }
+    f.flatMap { _ =>
+      SystemDatabase.execute(UserQueries.removeByPrimaryKey(Seq(userId)), Some(conn))(txTd).map { users =>
         UserCache.removeUser(userId)
-        Map(
-          "users" -> users,
-          "profiles" -> profiles,
-          "requests" -> requests,
-          "timing" -> (System.currentTimeMillis - start).toInt
-        )
+        val timing = ((System.nanoTime - startTime) / 1000000).toInt
+        Map("users" -> users, "timing" -> timing)
+      }
+    }
+  }(td))
+
+  def updateFields(id: UUID, username: String, email: String, password: Option[String], role: Role, originalEmail: String)(implicit trace: TraceData) = {
+    traceF("update.fields") { _ =>
+      val fields = Seq(
+        DataField("username", Some(username)),
+        DataField("email", Some(email)),
+        DataField("role", Some(role.toString))
+      )
+      SystemDatabase.execute(UserQueries.update(id, fields)).flatMap { _ =>
+        val emailUpdated = if (email != originalEmail) {
+          SystemDatabase.execute(PasswordInfoQueries.UpdateEmail(originalEmail, email))
+        } else {
+          Future.successful(0)
+        }
+        emailUpdated.flatMap { _ =>
+          password match {
+            case Some(p) =>
+              val loginInfo = LoginInfo(CredentialsProvider.ID, email)
+              val authInfo = hasher.hash(p)
+              SystemDatabase.execute(PasswordInfoQueries.UpdatePasswordInfo(loginInfo, authInfo))
+            case _ => Future.successful(id)
+          }
+        }.map { _ =>
+          UserCache.removeUser(id)
+          id
+        }
       }
     }
   }
 
-  def enableAdmin(user: User) = {
-    Database.query(UserQueries.CountAdmins).flatMap { adminCount =>
-      if (adminCount == 0) {
-        Database.execute(UserQueries.AddRole(user.id, Role.Admin)).map { x =>
-          UserCache.removeUser(user.id)
-          "OK"
-        }
-      } else {
-        Future.successful(s"Forbidden. $adminCount admins already exist.")
-      }
-    }
-  }
-
-  private[this] def removeProfiles(userId: UUID, conn: Option[Connection]) = Database.query(ProfileQueries.FindProfilesByUser(userId)).flatMap { profiles =>
-    Future.sequence(profiles.map { profile =>
-      (profile.loginInfo.providerID match {
-        case "credentials" => Database.execute(PasswordInfoQueries.removeById(Seq(profile.loginInfo.providerID, profile.loginInfo.providerKey)), conn)
-        case "facebook" => Database.execute(OAuth2InfoQueries.removeById(Seq(profile.loginInfo.providerID, profile.loginInfo.providerKey)), conn)
-        case "google" => Database.execute(OAuth2InfoQueries.removeById(Seq(profile.loginInfo.providerID, profile.loginInfo.providerKey)), conn)
-        case "twitter" => Database.execute(OAuth1InfoQueries.removeById(Seq(profile.loginInfo.providerID, profile.loginInfo.providerKey)), conn)
-        case p => throw new IllegalArgumentException(s"Unknown provider [$p].")
-      }).flatMap { infoCount =>
-        Database.execute(ProfileQueries.remove(Seq(profile.loginInfo.providerID, profile.loginInfo.providerKey)), conn).map { i =>
-          profile
-        }
-      }
-    })
+  def csvFor(operation: String, totalCount: Int, rows: Seq[User])(implicit trace: TraceData) = {
+    traceB("export.csv")(td => util.CsvUtils.csvFor(Some(key), totalCount, rows, UserQueries.fields)(td))
   }
 }

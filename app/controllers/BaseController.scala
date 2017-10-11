@@ -1,80 +1,81 @@
 package controllers
 
-import java.util.UUID
+import brave.Span
+import com.mohiva.play.silhouette.api.actions.{SecuredRequest, UserAwareRequest}
+import models.Application
+import models.auth.AuthEnv
+import models.result.data.DataField
+import models.user.{Role, User}
+import play.api.mvc._
+import util.metrics.Instrumented
+import util.web.TracingFilter
+import util.Logging
+import util.tracing.TraceData
+import zipkin.TraceKeys
 
-import models.history.RequestLog
-import services.history.RequestHistoryService
-import services.user.AuthenticationEnvironment
-import play.api.i18n.I18nSupport
-import com.mohiva.play.silhouette.api._
-import com.mohiva.play.silhouette.impl.authenticators.CookieAuthenticator
-import models.user.{ UserPreferences, Role, User }
-import nl.grons.metrics.scala.FutureMetrics
-import play.api.libs.concurrent.Execution.Implicits.defaultContext
-import play.api.mvc.{ AnyContent, RequestHeader, Result }
-import utils.{ DateUtils, Logging }
-import utils.metrics.Instrumented
+import scala.concurrent.{ExecutionContext, Future}
 
-import scala.concurrent.Future
+abstract class BaseController(val name: String) extends InjectedController with Instrumented with Logging {
+  protected def app: Application
 
-abstract class BaseController() extends Silhouette[User, CookieAuthenticator] with I18nSupport with Instrumented with FutureMetrics with Logging {
-  def env: AuthenticationEnvironment
+  protected def withoutSession(action: String)(
+    block: UserAwareRequest[AuthEnv, AnyContent] => TraceData => Future[Result]
+  )(implicit ec: ExecutionContext) = {
+    app.silhouette.UserAwareAction.async { implicit request =>
+      metrics.timer(name + "." + action).timeFuture {
+        app.tracing.trace(name + ".controller." + action) { td =>
+          enhanceRequest(request, request.identity, td.span)
+          block(request)(td)
+        }(getTraceData)
+      }
+    }
+  }
 
-  def withAdminSession(action: String)(block: (SecuredRequest[AnyContent]) => Future[Result]) = SecuredAction.async { implicit request =>
-    timing(action) {
-      val startTime = System.currentTimeMillis
-      if (request.identity.roles.contains(Role.Admin)) {
-        block(request).map { r =>
-          val duration = (System.currentTimeMillis - startTime).toInt
-          logRequest(request, request.identity.id, request.authenticator.loginInfo, duration, r.header.status)
-          r
+  protected def withSession(action: String, admin: Boolean = false)(
+    block: SecuredRequest[AuthEnv, AnyContent] => TraceData => Future[Result]
+  )(implicit ec: ExecutionContext) = {
+    app.silhouette.UserAwareAction.async { implicit request =>
+      request.identity match {
+        case Some(u) => if (admin && u.role != Role.Admin) {
+          failRequest(request)
+        } else {
+          metrics.timer(name + "." + action).timeFuture {
+            app.tracing.trace(name + ".controller." + action) { td =>
+              enhanceRequest(request, Some(u), td.span)
+              val r = SecuredRequest(u, request.authenticator.get, request)
+              block(r)(td)
+            }(getTraceData)
+          }
         }
-      } else {
-        Future.successful(NotFound("404 Not Found"))
+        case None => failRequest(request)
       }
     }
   }
 
-  def withSession(action: String)(block: (SecuredRequest[AnyContent]) => Future[Result]) = UserAwareAction.async { implicit request =>
-    timing(action) {
-      val startTime = System.currentTimeMillis
-      val response = request.identity match {
-        case Some(user) =>
-          val secured = SecuredRequest(user, request.authenticator.getOrElse(throw new IllegalStateException()), request)
-          block(secured).map { r =>
-            val duration = (System.currentTimeMillis - startTime).toInt
-            logRequest(secured, secured.identity.id, secured.authenticator.loginInfo, duration, r.header.status)
-            r
-          }
-        case None =>
-          val user = User(
-            id = UUID.randomUUID(),
-            username = None,
-            preferences = UserPreferences(),
-            profiles = Nil,
-            created = DateUtils.now
-          )
+  protected def getTraceData(implicit requestHeader: RequestHeader) = requestHeader.attrs(TracingFilter.traceKey)
 
-          for {
-            user <- env.userService.save(user)
-            authenticator <- env.authenticatorService.create(LoginInfo("anonymous", user.id.toString))
-            value <- env.authenticatorService.init(authenticator)
-            result <- block(SecuredRequest(user, authenticator, request))
-            authedResponse <- env.authenticatorService.embed(value, result)
-          } yield {
-            env.eventBus.publish(SignUpEvent(user, request, request2Messages))
-            env.eventBus.publish(LoginEvent(user, request, request2Messages))
-            val duration = (System.currentTimeMillis - startTime).toInt
-            logRequest(request, user.id, authenticator.loginInfo, duration, authedResponse.header.status)
-            authedResponse
-          }
-      }
-      response
+  protected def modelForm(rawForm: Option[Map[String, Seq[String]]]) = {
+    val form = rawForm.getOrElse(Map.empty).mapValues(_.head)
+    val fields = form.toSeq.filter(x => x._1.endsWith(".include") && x._2 == "true").map(_._1.stripSuffix(".include"))
+    fields.map(f => DataField(f, Some(form.getOrElse(f, throw new IllegalStateException(s"Cannot find value for included field [$f].")))))
+  }
+
+  private[this] def enhanceRequest(request: Request[AnyContent], user: Option[User], trace: Span) = {
+    trace.tag(TraceKeys.HTTP_REQUEST_SIZE, request.body.asText.map(_.length).orElse(request.body.asRaw.map(_.size)).getOrElse(0).toString)
+    user.foreach { u =>
+      trace.tag("user.id", u.id.toString)
+      trace.tag("user.username", u.username)
+      trace.tag("user.email", u.profile.providerKey)
+      trace.tag("user.role", u.role.toString)
     }
   }
 
-  private[this] def logRequest(request: RequestHeader, userId: UUID, loginInfo: LoginInfo, duration: Int, status: Int) = {
-    val log = RequestLog(request, userId, loginInfo, duration, status)
-    RequestHistoryService.insert(log)
+  private[this] def failRequest(request: UserAwareRequest[AuthEnv, AnyContent]) = {
+    val msg = request.identity match {
+      case Some(_) => "You must be an administrator to access that."
+      case None => s"You must sign in or register before accessing ${util.Config.projectName}."
+    }
+    val res = Redirect(controllers.auth.routes.AuthenticationController.signInForm())
+    Future.successful(res.flashing("error" -> msg).withSession(request.session + ("returnUrl" -> request.uri)))
   }
 }

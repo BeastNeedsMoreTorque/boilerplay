@@ -1,80 +1,61 @@
 package controllers.auth
 
 import com.mohiva.play.silhouette.api.exceptions.ProviderException
-import com.mohiva.play.silhouette.api.{ LoginEvent, LogoutEvent }
+import com.mohiva.play.silhouette.api.{LoginEvent, LogoutEvent}
 import com.mohiva.play.silhouette.impl.exceptions.IdentityNotFoundException
-import com.mohiva.play.silhouette.impl.providers.{ CommonSocialProfile, CommonSocialProfileBuilder, SocialProvider }
+import com.mohiva.play.silhouette.impl.providers.CredentialsProvider
 import controllers.BaseController
-import models.user.{ User, UserForms }
-import play.api.i18n.{ Messages, MessagesApi }
-import play.api.libs.concurrent.Execution.Implicits.defaultContext
-import services.user.AuthenticationEnvironment
+import models.Application
+import models.user.UserForms
+import services.user.UserSearchService
 
 import scala.concurrent.Future
 
 @javax.inject.Singleton
 class AuthenticationController @javax.inject.Inject() (
-    override val messagesApi: MessagesApi,
-    override val env: AuthenticationEnvironment
-) extends BaseController {
-  def signInForm = withSession("form") { implicit request =>
-    Future.successful(Ok(views.html.auth.signin(request.identity, UserForms.signInForm)))
+    override val app: Application,
+    userSearchService: UserSearchService,
+    credentialsProvider: CredentialsProvider
+) extends BaseController("authentication") {
+  import app.contexts.webContext
+
+  def signInForm = withoutSession("form") { implicit request => implicit td =>
+    //val src = request.headers.get("Referer").filter(_.contains(request.host))
+    val resp = Ok(views.html.auth.signin(request.identity, UserForms.signInForm, app.settingsService.allowRegistration))
+    Future.successful(resp)
   }
 
-  def authenticateCredentials = withSession("authenticate") { implicit request =>
+  def authenticateCredentials = withoutSession("authenticate") { implicit request => implicit td =>
     UserForms.signInForm.bindFromRequest.fold(
-      form => Future.successful(BadRequest(views.html.auth.signin(request.identity, form))),
-      credentials => env.credentials.authenticate(credentials).flatMap { loginInfo =>
-        val result = Redirect(controllers.routes.HomeController.index())
-        env.identityService.retrieve(loginInfo).flatMap {
-          case Some(user) => env.authenticatorService.create(loginInfo).flatMap { authenticator =>
-            env.eventBus.publish(LoginEvent(user, request, request2Messages))
-            env.authenticatorService.init(authenticator).flatMap(v => env.authenticatorService.embed(v, result))
+      form => Future.successful(BadRequest(views.html.auth.signin(request.identity, form, app.settingsService.allowRegistration))),
+      credentials => {
+        val creds = credentials.copy(identifier = credentials.identifier.toLowerCase)
+        credentialsProvider.authenticate(creds).flatMap { loginInfo =>
+          val result = request.session.get("returnUrl") match {
+            case Some(url) => Redirect(url).withSession(request.session - "returnUrl")
+            case None => Redirect(controllers.routes.HomeController.home())
           }
-          case None => Future.failed(new IdentityNotFoundException("Couldn't find user."))
+          userSearchService.getByLoginInfo(loginInfo).flatMap {
+            case Some(user) => app.silhouette.env.authenticatorService.create(loginInfo).flatMap { authenticator =>
+              app.silhouette.env.eventBus.publish(LoginEvent(user, request))
+              app.silhouette.env.authenticatorService.init(authenticator).flatMap { v =>
+                app.silhouette.env.authenticatorService.embed(v, result).map { x =>
+                  x
+                }
+              }
+            }
+            case None => Future.failed(new IdentityNotFoundException(s"Couldn't find user [${loginInfo.providerID}]."))
+          }
+        }.recover {
+          case _: ProviderException => Redirect(controllers.auth.routes.AuthenticationController.signInForm()).flashing("error" -> "Invalid credentials")
         }
-      }.recover {
-        case e: ProviderException =>
-          Redirect(controllers.auth.routes.AuthenticationController.signInForm()).flashing("error" -> Messages("authentication.invalid.credentials"))
       }
     )
   }
 
-  def authenticateSocial(provider: String) = withSession("authenticate.social") { implicit request =>
-    (env.providersMap.get(provider) match {
-      case Some(p: SocialProvider with CommonSocialProfileBuilder) =>
-        p.authenticate().flatMap {
-          case Left(result) => Future.successful(result)
-          case Right(authInfo) => for {
-            profile <- p.retrieveProfile(authInfo)
-            user <- env.userService.create(mergeUser(request.identity, profile), profile)
-            authInfo <- env.authInfoService.save(profile.loginInfo, authInfo)
-            authenticator <- env.authenticatorService.create(profile.loginInfo)
-            value <- env.authenticatorService.init(authenticator)
-            result <- env.authenticatorService.embed(value, Redirect(controllers.routes.HomeController.index()))
-          } yield {
-            env.eventBus.publish(LoginEvent(user, request, request2Messages))
-            result
-          }
-        }
-      case _ => Future.failed(new ProviderException(Messages("authentication.invalid.provider", provider)))
-    }).recover {
-      case e: ProviderException =>
-        logger.error("Unexpected provider error", e)
-        Redirect(routes.AuthenticationController.signInForm()).flashing("error" -> Messages("authentication.service.error", provider))
-    }
-  }
-
-  def signOut = withSession("signout") { implicit request =>
-    val result = Redirect(controllers.routes.HomeController.index())
-    env.eventBus.publish(LogoutEvent(request.identity, request, request2Messages))
-    env.authenticatorService.discard(request.authenticator, result).map(x => result)
-  }
-
-  private[this] def mergeUser(user: User, profile: CommonSocialProfile) = {
-    user.copy(
-      username = if (profile.firstName.isDefined && user.username.isEmpty) { profile.firstName } else { user.username },
-      preferences = user.preferences.copy(avatar = profile.avatarURL.getOrElse(user.preferences.avatar))
-    )
+  def signOut = withSession("signout") { implicit request => implicit td =>
+    implicit val result = Redirect(controllers.routes.HomeController.home())
+    app.silhouette.env.eventBus.publish(LogoutEvent(request.identity, request))
+    app.silhouette.env.authenticatorService.discard(request.authenticator, result)
   }
 }
